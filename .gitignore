@@ -1,0 +1,5 @@
+node_modules/
+prebuilds/
+build/
+*.tgz
+.scratch/

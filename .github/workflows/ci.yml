@@ -1,0 +1,228 @@
+name: CI
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: darwin-arm64
+          - os: macos-15-intel
+            target: darwin-x64
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: windows-latest
+            target: win32-x64
+            msvc: x64
+          - os: windows-11-arm
+            target: win32-arm64
+            msvc: arm64
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run format:check
+      - run: npm run typecheck
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ matrix.msvc }}
+      - run: npm run build
+      - name: Static binary and POSIX launcher
+        if: runner.os == 'Linux'
+        run: |
+          file prebuilds/${{ matrix.target }}/cow-clone | tee /dev/stderr | grep -q 'statically linked'
+          dash -n bin/cow-clone
+          sh -n bin/cow-clone
+      - name: btrfs and XFS loopback mounts
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq btrfs-progs xfsprogs > /dev/null
+          for fs in btrfs xfs; do
+            truncate -s 1G "$RUNNER_TEMP/$fs.img"
+          done
+          mkfs.btrfs -q "$RUNNER_TEMP/btrfs.img"
+          mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/xfs.img"
+          for fs in btrfs xfs; do
+            sudo mkdir -p "/mnt/$fs"
+            sudo mount -o loop "$RUNNER_TEMP/$fs.img" "/mnt/$fs"
+            sudo chown "$(id -u):$(id -g)" "/mnt/$fs"
+          done
+          echo "COW_CLONE_REFLINK_DIRS=/mnt/btrfs:/mnt/xfs" >> "$GITHUB_ENV"
+      - name: ReFS volume
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vhd = Join-Path $env:RUNNER_TEMP 'refs.vhdx'
+          $script = Join-Path $env:RUNNER_TEMP 'refs.txt'
+          @(
+            "create vdisk file=`"$vhd`" maximum=4096 type=expandable",
+            "select vdisk file=`"$vhd`"",
+            'attach vdisk',
+            'create partition primary',
+            'format fs=refs quick label=refs',
+            'assign letter=R'
+          ) | Set-Content -Encoding ascii $script
+          diskpart /s $script
+          if ($LASTEXITCODE -ne 0) { throw "diskpart failed with $LASTEXITCODE" }
+          "COW_CLONE_REFS_DIR=R:\" >> $env:GITHUB_ENV
+      - run: npm test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20.19.4
+      - run: npm test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.target }}
+          path: prebuilds/
+  bench:
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, fs: apfs }
+          - { os: ubuntu-latest, fs: btrfs }
+          - { os: ubuntu-latest, fs: xfs }
+          - { os: windows-latest, msvc: x64, fs: refs }
+    runs-on: ${{ matrix.os }}
+    name: bench (${{ matrix.os }}, ${{ matrix.fs }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: ${{ matrix.msvc }}
+      - run: npm run build
+      - name: Disk
+        if: matrix.fs == 'apfs'
+        run: echo "BENCH_DIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: btrfs or XFS loopback mount
+        if: matrix.fs == 'btrfs' || matrix.fs == 'xfs'
+        run: |
+          sudo apt-get install -y -qq btrfs-progs xfsprogs > /dev/null
+          truncate -s 8G "$RUNNER_TEMP/fs.img"
+          if [ "${{ matrix.fs }}" = btrfs ]; then mkfs.btrfs -q "$RUNNER_TEMP/fs.img"; else mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/fs.img"; fi
+          sudo mkdir -p /mnt/bench
+          sudo mount -o loop "$RUNNER_TEMP/fs.img" /mnt/bench
+          sudo chown "$(id -u):$(id -g)" /mnt/bench
+          echo "BENCH_DIR=/mnt/bench" >> "$GITHUB_ENV"
+      - name: ReFS volume
+        if: matrix.fs == 'refs'
+        shell: pwsh
+        run: |
+          $vhd = Join-Path $env:RUNNER_TEMP 'refs.vhdx'
+          $script = Join-Path $env:RUNNER_TEMP 'refs.txt'
+          @(
+            "create vdisk file=`"$vhd`" maximum=8192 type=expandable",
+            "select vdisk file=`"$vhd`"",
+            'attach vdisk',
+            'create partition primary',
+            'format fs=refs quick label=refs',
+            'assign letter=R'
+          ) | Set-Content -Encoding ascii $script
+          diskpart /s $script
+          if ($LASTEXITCODE -ne 0) { throw "diskpart failed with $LASTEXITCODE" }
+          "BENCH_DIR=R:\" >> $env:GITHUB_ENV
+      - name: Benchmark on a generated node_modules
+        shell: bash
+        run: node scripts/bench.mjs --generate "$BENCH_DIR/bench" --files 40000 --runs 5
+  package:
+    needs: platforms
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: prebuild-*
+          path: prebuilds
+          merge-multiple: true
+      - run: npm run pack:release
+      - run: tar -tvzf cow-clone-*.tgz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: cow-clone-*.tgz
+  smoke:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          [
+            ubuntu-latest,
+            ubuntu-24.04-arm,
+            macos-latest,
+            macos-15-intel,
+            windows-latest,
+            windows-11-arm,
+          ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: package
+      - name: Install the tarball and run the CLI and the API
+        shell: bash
+        run: npm run test:package -- ./package/cow-clone-*.tgz
+      - run: npm install --global pnpm@latest yarn@1
+      - name: npm, pnpm, Yarn classic and Yarn Berry
+        shell: bash
+        run: |
+          pnpm --version
+          yarn --version
+          status=0
+          for manager in npm pnpm yarn-classic yarn-berry; do
+            node scripts/managers-smoke.mjs "$manager" ./package/cow-clone-*.tgz || status=1
+          done
+          exit $status
+  alpine:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: package
+      - name: npm, pnpm, Yarn classic and Yarn Berry on Alpine with BusyBox
+        run: |
+          mkdir .scratch
+          docker run --rm -v "$PWD":/w -w /w -e TMPDIR=/w/.scratch node:22-alpine sh -c '
+            ls -l /bin/sh /usr/bin/env
+            npm install --global pnpm@latest > /dev/null
+            pnpm --version
+            yarn --version
+            status=0
+            for manager in npm pnpm yarn-classic yarn-berry; do
+              node scripts/managers-smoke.mjs "$manager" ./package/cow-clone-*.tgz || status=1
+            done
+            exit $status'
