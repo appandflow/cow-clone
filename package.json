@@ -1,6 +1,6 @@
 {
   "name": "cow-clone",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Copy-on-write clones of files and whole directory trees on APFS, btrfs, XFS, bcachefs and ReFS, with a reason when a clone is not possible",
   "type": "module",
   "engines": {
