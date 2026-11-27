@@ -42,7 +42,9 @@ static int remove_at(int directory, const char *name) {
   struct stat st;
   if (fstatat(directory, name, &st, AT_SYMLINK_NOFOLLOW)) return 0;
   if (!S_ISDIR(st.st_mode)) return unlinkat(directory, name, 0) == 0;
-  fchmodat(directory, name, 0700, 0);
+  /* A failure here shows as a failure to remove the entries below. */
+  int writable = fchmodat(directory, name, 0700, 0) == 0;
+  (void)writable;
   int fd = openat(directory, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   DIR *entries = fd >= 0 ? fdopendir(fd) : NULL;
   if (entries) {

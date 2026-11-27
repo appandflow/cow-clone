@@ -224,7 +224,11 @@ static int clone_regular(struct walker *walker, const struct entry *entry, int d
     return fail(walker, error, REASON_FAILED, &walker->destination);
   }
   if (depth == 0) walker->created = 1;
-  int ok = duplicate(walker, source, target, entry) && set_times(walker, target, entry);
+  /* The times FindFirstFileExW reports come from the parent directory's index, which can be stale; the file's own
+   * are not. */
+  struct entry own = *entry;
+  GetFileTime(source, &own.created, &own.accessed, &own.written);
+  int ok = duplicate(walker, source, target, entry) && set_times(walker, target, &own);
   CloseHandle(target);
   CloseHandle(source);
   if (ok && (entry->attributes & SETTABLE_ATTRIBUTES) &&
@@ -283,7 +287,19 @@ static struct entry entry_of(const WIN32_FIND_DATAW *data) {
   return entry;
 }
 
-static int clone_directory(struct walker *walker, const struct entry *entry, int depth) {
+static int clone_directory(struct walker *walker, const struct entry *listed, int depth) {
+  /* A directory's times in its parent's index (what FindFirstFileExW reports) can lag behind its own, so read them
+   * from the directory, before listing it. */
+  struct entry own = *listed;
+  const struct entry *entry = &own;
+  HANDLE source = CreateFileW(walker->source.text, FILE_READ_ATTRIBUTES,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                              FILE_FLAG_BACKUP_SEMANTICS, NULL);
+  if (source == INVALID_HANDLE_VALUE) return fail(walker, GetLastError(), REASON_FAILED, &walker->source);
+  BOOL timed = GetFileTime(source, &own.created, &own.accessed, &own.written);
+  DWORD error = GetLastError();
+  CloseHandle(source);
+  if (!timed) return fail(walker, error, REASON_FAILED, &walker->source);
   if (!CreateDirectoryW(walker->destination.text, NULL))
     return fail(walker, GetLastError(), REASON_FAILED, &walker->destination);
   if (depth == 0) walker->created = 1;
@@ -291,7 +307,7 @@ static int clone_directory(struct walker *walker, const struct entry *entry, int
   size_t pattern = path_push(&walker->source, L"*");
   HANDLE find = FindFirstFileExW(walker->source.text, FindExInfoBasic, &data, FindExSearchNameMatch, NULL,
                                  FIND_FIRST_EX_LARGE_FETCH);
-  DWORD error = GetLastError();
+  error = GetLastError();
   path_pop(&walker->source, pattern);
   if (find == INVALID_HANDLE_VALUE) return fail(walker, error, REASON_FAILED, &walker->source);
   int ok = 1;
@@ -490,6 +506,7 @@ int wmain(int argc, wchar_t **wide) {
 #endif
   _setmode(_fileno(stdin), _O_BINARY);
   _setmode(_fileno(stdout), _O_BINARY);
+  _setmode(_fileno(stderr), _O_BINARY);
   char **argv = calloc((size_t)argc + 1, sizeof *argv);
   if (!argv) return 1;
   for (int i = 0; i < argc; i++) {
