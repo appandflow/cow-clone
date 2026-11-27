@@ -8,13 +8,18 @@ void set_failure(struct failure *failure, int error, enum reason reason, const c
 /* Removes `path` and everything below it without following symbolic links. */
 void remove_tree(const char *path);
 
-/* Clones the tree at `source` one file at a time with clone_file, recreating directories and symbolic links with
- * their modes and times. */
+#include <sys/stat.h>
+
+/* Clones the tree at `source` file by file with clone_regular_file, on several threads, recreating directories and
+ * symbolic links with their modes and times. */
 int walk_clone(const char *source, const char *destination, struct failure *failure);
 
-/* Creates `name` in `directory` as a clone of the open regular file `source`. On failure returns -1 with errno set,
- * and sets *clone_call when the clone itself failed rather than creating the file. */
-int clone_file(int source, int directory, const char *name, int *clone_call);
+enum file_step { STEP_SOURCE, STEP_DESTINATION, STEP_CLONE };
+
+/* Clones the regular file `source` to `destination` with the mode and times in `st`. Runs with a umask of 0. On
+ * failure returns -1 with errno set and *step naming the call that failed, and removes `destination` if it created
+ * it. */
+int clone_regular_file(const char *source, const char *destination, const struct stat *st, enum file_step *step);
 
 /* The reason a failed clone call gives, from its errno. */
 enum reason clone_reason(int error);

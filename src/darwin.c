@@ -1,4 +1,6 @@
 #include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/attr.h>
 #include <sys/clonefile.h>
 #include <sys/stat.h>
@@ -12,9 +14,21 @@ enum reason clone_reason(int error) {
   return REASON_FAILED;
 }
 
-int clone_file(int source, int directory, const char *name, int *clone_call) {
-  if (fclonefileat(source, directory, name, 0) == 0) return 0;
-  *clone_call = 1;
+int clone_regular_file(const char *source, const char *destination, const struct stat *st, enum file_step *step) {
+  (void)st;
+  /* Opened first, as on Linux, so the walker build fails on an unreadable file the same way. fclonefileat(2) keeps
+   * the mode and times itself. */
+  int from = open(source, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (from < 0) {
+    *step = STEP_SOURCE;
+    return -1;
+  }
+  int ok = fclonefileat(from, AT_FDCWD, destination, 0) == 0;
+  int error = errno;
+  close(from);
+  if (ok) return 0;
+  *step = error == EEXIST ? STEP_DESTINATION : STEP_CLONE;
+  errno = error;
   return -1;
 }
 

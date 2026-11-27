@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readdirSync,
   rmSync,
+  statfsSync,
   writeFileSync,
 } from "node:fs";
 import { cpus } from "node:os";
@@ -131,6 +132,17 @@ const variants = [
     run: (destination) => run(binary, [source, destination]),
   },
 ];
+if (process.platform !== "darwin")
+  variants.push({
+    name: "the whole tree as one pair, one thread",
+    run: (destination) => {
+      const result = spawnSync(binary, [source, destination], {
+        env: { ...process.env, COW_CLONE_THREADS: "1" },
+      });
+      if (result.status !== 0)
+        throw new Error(`cow-clone exited with ${result.status}`);
+    },
+  });
 if (process.platform === "darwin" && existsSync(walker))
   variants.push({
     name: "walker build (file by file, as on Linux), one process",
@@ -161,6 +173,14 @@ if (!values["skip-copy"])
       }),
   });
 
+/** Free bytes on the scratch volume, after a sync so btrfs and XFS have accounted for what was written. ReFS frees
+ * deleted clusters later, so its numbers are not shown. */
+function freeBytes() {
+  if (process.platform !== "win32") spawnSync("sync");
+  const { bavail, bsize } = statfsSync(scratch);
+  return bavail * bsize;
+}
+
 const median = (list) =>
   [...list].sort((a, b) => a - b)[Math.floor(list.length / 2)];
 console.log(
@@ -168,29 +188,32 @@ console.log(
     `source: ${source} (${entries.length} top-level entries, ${countFiles(source)} files), median of ${runs} runs\n`,
 );
 console.log(
-  "| variant | median ms | min ms | max ms |\n| --- | ---: | ---: | ---: |",
+  "| variant | median ms | min ms | max ms | MiB used |\n| --- | ---: | ---: | ---: | ---: |",
 );
 try {
   for (const variant of variants) {
     const times = [];
+    let used = 0;
     for (let i = 0; i < runs; i++) {
       const destination = join(scratch, `run-${i}`);
+      const free = freeBytes();
       const start = process.hrtime.bigint();
       try {
         variant.run(destination);
       } catch (error) {
         console.log(
-          `| ${variant.name} | ${error.message.split("\n")[0]} | | |`,
+          `| ${variant.name} | ${error.message.split("\n")[0]} | | | |`,
         );
         times.length = 0;
         break;
       }
       times.push(Number(process.hrtime.bigint() - start) / 1e6);
+      if (i === 0) used = free - freeBytes();
       rmSync(destination, { recursive: true, force: true });
     }
     if (times.length)
       console.log(
-        `| ${variant.name} | ${median(times).toFixed(0)} | ${Math.min(...times).toFixed(0)} | ${Math.max(...times).toFixed(0)} |`,
+        `| ${variant.name} | ${median(times).toFixed(0)} | ${Math.min(...times).toFixed(0)} | ${Math.max(...times).toFixed(0)} | ${process.platform === "win32" ? "n/a" : (used / 2 ** 20).toFixed(0)} |`,
       );
   }
 } finally {

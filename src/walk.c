@@ -1,6 +1,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -16,104 +17,78 @@
 #define MODIFY_TIME(st) ((st).st_mtim)
 #endif
 
-struct path {
-  char *text;
-  size_t length, capacity;
+#define MAX_THREADS 8
+
+/* A file or directory to finish: its source path for files, its destination path, and its source's status. */
+struct job {
+  char *source;
+  char *destination;
+  struct stat st;
+};
+
+struct jobs {
+  struct job *items;
+  size_t count, capacity;
 };
 
 struct walker {
   struct failure *failure;
-  struct path source, destination;
-  int created;
+  struct jobs files, directories;
+  int created, probed;
+  /* Shared by the file threads. */
+  pthread_mutex_t lock;
+  size_t next;
+  int failed;
 };
 
-static void path_init(struct path *path, const char *text) {
-  path->length = strlen(text);
-  path->capacity = path->length + 256;
-  path->text = malloc(path->capacity);
-  if (!path->text) out_of_memory();
-  memcpy(path->text, text, path->length + 1);
+static char *join(const char *directory, const char *name) {
+  size_t length = strlen(directory), name_length = strlen(name);
+  char *path = malloc(length + name_length + 2);
+  if (!path) out_of_memory();
+  memcpy(path, directory, length);
+  path[length] = '/';
+  memcpy(path + length + 1, name, name_length + 1);
+  return path;
 }
 
-static size_t path_push(struct path *path, const char *name) {
-  size_t before = path->length, length = strlen(name);
-  if (before + length + 2 > path->capacity) {
-    path->capacity = (before + length + 2) * 2;
-    path->text = realloc(path->text, path->capacity);
-    if (!path->text) out_of_memory();
+static char *copy(const char *text) {
+  size_t length = strlen(text);
+  char *path = malloc(length + 1);
+  if (!path) out_of_memory();
+  memcpy(path, text, length + 1);
+  return path;
+}
+
+static void add(struct jobs *jobs, char *source, char *destination, const struct stat *st) {
+  if (jobs->count == jobs->capacity) {
+    jobs->capacity = jobs->capacity ? jobs->capacity * 2 : 1024;
+    jobs->items = realloc(jobs->items, jobs->capacity * sizeof *jobs->items);
+    if (!jobs->items) out_of_memory();
   }
-  path->text[before] = '/';
-  memcpy(path->text + before + 1, name, length + 1);
-  path->length = before + length + 1;
-  return before;
+  jobs->items[jobs->count++] = (struct job){source, destination, *st};
 }
 
-static void path_pop(struct path *path, size_t before) {
-  path->length = before;
-  path->text[before] = '\0';
+static void release(struct jobs *jobs) {
+  for (size_t i = 0; i < jobs->count; i++) {
+    free(jobs->items[i].source);
+    free(jobs->items[i].destination);
+  }
+  free(jobs->items);
 }
 
-static int fail(struct walker *walker, int error, enum reason reason, const struct path *path) {
-  set_failure(walker->failure, error, reason, path->text);
+static int fail(struct walker *walker, int error, enum reason reason, const char *path) {
+  set_failure(walker->failure, error, reason, path);
   return 0;
 }
 
-static int set_times(struct walker *walker, int directory, const char *name, const struct stat *st) {
+static int set_times(struct walker *walker, const char *path, const struct stat *st) {
   struct timespec times[2] = {ACCESS_TIME(*st), MODIFY_TIME(*st)};
-  if (utimensat(directory, name, times, AT_SYMLINK_NOFOLLOW)) return fail(walker, errno, REASON_FAILED, &walker->destination);
+  if (utimensat(AT_FDCWD, path, times, AT_SYMLINK_NOFOLLOW)) return fail(walker, errno, REASON_FAILED, path);
   return 1;
 }
 
-static int clone_entry(struct walker *walker, int source_directory, const char *source_name, int directory,
-                       const char *name, int depth);
-
-static int clone_directory(struct walker *walker, int source_directory, const char *source_name, int directory,
-                           const char *name, const struct stat *st, int depth) {
-  if (mkdirat(directory, name, 0700)) return fail(walker, errno, REASON_FAILED, &walker->destination);
-  if (depth == 0) walker->created = 1;
-  int source = openat(source_directory, source_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (source < 0) return fail(walker, errno, REASON_FAILED, &walker->source);
-  DIR *entries = fdopendir(source);
-  if (!entries) {
-    int error = errno;
-    close(source);
-    return fail(walker, error, REASON_FAILED, &walker->source);
-  }
-  int target = openat(directory, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-  if (target < 0) {
-    int error = errno;
-    closedir(entries);
-    return fail(walker, error, REASON_FAILED, &walker->destination);
-  }
-  int ok = 1;
-  for (;;) {
-    errno = 0;
-    struct dirent *entry = readdir(entries);
-    if (!entry) {
-      if (errno) ok = fail(walker, errno, REASON_FAILED, &walker->source);
-      break;
-    }
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
-    size_t source_before = path_push(&walker->source, entry->d_name);
-    size_t before = path_push(&walker->destination, entry->d_name);
-    ok = clone_entry(walker, dirfd(entries), entry->d_name, target, entry->d_name, depth + 1);
-    if (!ok) break;
-    path_pop(&walker->source, source_before);
-    path_pop(&walker->destination, before);
-  }
-  closedir(entries);
-  if (ok && fchmod(target, st->st_mode & 07777)) ok = fail(walker, errno, REASON_FAILED, &walker->destination);
-  if (ok) {
-    /* Written last: creating the entries above changed the directory's times. */
-    struct timespec times[2] = {ACCESS_TIME(*st), MODIFY_TIME(*st)};
-    if (futimens(target, times)) ok = fail(walker, errno, REASON_FAILED, &walker->destination);
-  }
-  close(target);
-  return ok;
-}
-
-static int clone_link(struct walker *walker, int source_directory, const char *source_name, int directory,
-                      const char *name, const struct stat *st, int depth) {
+static int clone_link(struct walker *walker, const char *source, const char *destination, const struct stat *st,
+                      int depth) {
   /* st_size is the target's length on Linux and macOS, but some file systems report 0, so grow until it fits. */
   size_t capacity = st->st_size > 0 ? (size_t)st->st_size + 1 : 256;
   char *target;
@@ -121,61 +96,146 @@ static int clone_link(struct walker *walker, int source_directory, const char *s
   for (;;) {
     target = malloc(capacity);
     if (!target) out_of_memory();
-    length = readlinkat(source_directory, source_name, target, capacity);
+    length = readlink(source, target, capacity);
     if (length < 0) {
       int error = errno;
       free(target);
-      return fail(walker, error, REASON_FAILED, &walker->source);
+      return fail(walker, error, REASON_FAILED, source);
     }
     if ((size_t)length < capacity) break;
     free(target);
     capacity *= 2;
   }
   target[length] = '\0';
-  int created = symlinkat(target, directory, name) == 0;
+  int created = symlink(target, destination) == 0;
   int error = errno;
   free(target);
-  if (!created) return fail(walker, error, REASON_FAILED, &walker->destination);
+  if (!created) return fail(walker, error, REASON_FAILED, destination);
   if (depth == 0) walker->created = 1;
-  return set_times(walker, directory, name, st);
+#ifdef __APPLE__
+  /* macOS keeps a mode on symbolic links, which the umask of 0 would leave at 0777. */
+  if (fchmodat(AT_FDCWD, destination, st->st_mode & 07777, AT_SYMLINK_NOFOLLOW))
+    return fail(walker, errno, REASON_FAILED, destination);
+#endif
+  return set_times(walker, destination, st);
 }
 
-static int clone_regular(struct walker *walker, int source_directory, const char *source_name, int directory,
-                         const char *name, const struct stat *st, int depth) {
-  int source = openat(source_directory, source_name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-  if (source < 0) return fail(walker, errno, REASON_FAILED, &walker->source);
-  int clone_call = 0;
-  int cloned = clone_file(source, directory, name, &clone_call) == 0;
-  int error = errno;
-  close(source);
-  if (depth == 0 && (cloned || clone_call)) walker->created = 1;
-  if (!cloned)
-    return fail(walker, error, clone_call ? clone_reason(error) : REASON_FAILED, &walker->destination);
-  if (fchmodat(directory, name, st->st_mode & 07777, 0)) return fail(walker, errno, REASON_FAILED, &walker->destination);
-  return set_times(walker, directory, name, st);
-}
-
-static int clone_entry(struct walker *walker, int source_directory, const char *source_name, int directory,
-                       const char *name, int depth) {
+/* Creates the destination's directories and symbolic links and lists its files, which the threads clone after. */
+static int plan(struct walker *walker, const char *source, const char *destination, int depth) {
   struct stat st;
-  if (fstatat(source_directory, source_name, &st, AT_SYMLINK_NOFOLLOW))
-    return fail(walker, errno, REASON_FAILED, &walker->source);
-  if (S_ISREG(st.st_mode)) return clone_regular(walker, source_directory, source_name, directory, name, &st, depth);
-  if (S_ISDIR(st.st_mode)) return clone_directory(walker, source_directory, source_name, directory, name, &st, depth);
-  if (S_ISLNK(st.st_mode)) return clone_link(walker, source_directory, source_name, directory, name, &st, depth);
-  fail(walker, EINVAL, REASON_FAILED, &walker->source);
-  strcpy(walker->failure->code, "ESPECIAL");
-  strcpy(walker->failure->message, "A FIFO, socket or device file cannot be cloned");
-  return 0;
+  if (lstat(source, &st)) return fail(walker, errno, REASON_FAILED, source);
+  if (S_ISREG(st.st_mode)) {
+    if (walker->probed) {
+      add(&walker->files, copy(source), copy(destination), &st);
+      return 1;
+    }
+    /* The first file is cloned at once, so a file system that cannot clone fails before the rest is planned. */
+    walker->probed = 1;
+    enum file_step step;
+    if (clone_regular_file(source, destination, &st, &step) == 0) return 1;
+    int error = errno;
+    return fail(walker, error, step == STEP_CLONE ? clone_reason(error) : REASON_FAILED,
+                step == STEP_SOURCE ? source : destination);
+  }
+  if (S_ISLNK(st.st_mode)) return clone_link(walker, source, destination, &st, depth);
+  if (!S_ISDIR(st.st_mode)) {
+    fail(walker, EINVAL, REASON_FAILED, source);
+    strcpy(walker->failure->code, "ESPECIAL");
+    strcpy(walker->failure->message, "A FIFO, socket or device file cannot be cloned");
+    return 0;
+  }
+  /* Writable until the files are in; the mode and times are set once the threads are done. */
+  if (mkdir(destination, 0700)) return fail(walker, errno, REASON_FAILED, destination);
+  if (depth == 0) walker->created = 1;
+  add(&walker->directories, NULL, copy(destination), &st);
+  int fd = open(source, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  DIR *entries = fd >= 0 ? fdopendir(fd) : NULL;
+  if (!entries) {
+    int error = errno;
+    if (fd >= 0) close(fd);
+    return fail(walker, error, REASON_FAILED, source);
+  }
+  int ok = 1;
+  while (ok) {
+    errno = 0;
+    struct dirent *entry = readdir(entries);
+    if (!entry) {
+      if (errno) ok = fail(walker, errno, REASON_FAILED, source);
+      break;
+    }
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+    char *from = join(source, entry->d_name);
+    char *to = join(destination, entry->d_name);
+    ok = plan(walker, from, to, depth + 1);
+    free(from);
+    free(to);
+  }
+  closedir(entries);
+  return ok;
+}
+
+static void *clone_files(void *argument) {
+  struct walker *walker = argument;
+  for (;;) {
+    pthread_mutex_lock(&walker->lock);
+    size_t index = walker->failed ? walker->files.count : walker->next++;
+    pthread_mutex_unlock(&walker->lock);
+    if (index >= walker->files.count) return NULL;
+    const struct job *job = &walker->files.items[index];
+    enum file_step step;
+    if (clone_regular_file(job->source, job->destination, &job->st, &step) == 0) continue;
+    int error = errno;
+    pthread_mutex_lock(&walker->lock);
+    if (!walker->failed) {
+      walker->failed = 1;
+      fail(walker, error, step == STEP_CLONE ? clone_reason(error) : REASON_FAILED,
+           step == STEP_SOURCE ? job->source : job->destination);
+    }
+    pthread_mutex_unlock(&walker->lock);
+  }
+}
+
+static size_t thread_count(size_t files) {
+  long count = sysconf(_SC_NPROCESSORS_ONLN);
+  const char *setting = getenv("COW_CLONE_THREADS");
+  if (setting && atoi(setting) > 0) count = atoi(setting);
+  if (count < 1) count = 1;
+  if (count > MAX_THREADS) count = MAX_THREADS;
+  /* A thread start costs more than cloning a few files. */
+  if ((size_t)count > files / 64 + 1) count = (long)(files / 64 + 1);
+  return (size_t)count;
+}
+
+static int finish_directories(struct walker *walker) {
+  /* Deepest first: setting a directory's mode or times after its parent's would change the parent's times. */
+  for (size_t i = walker->directories.count; i-- > 0;) {
+    const struct job *job = &walker->directories.items[i];
+    if (chmod(job->destination, job->st.st_mode & 07777))
+      return fail(walker, errno, REASON_FAILED, job->destination);
+    if (!set_times(walker, job->destination, &job->st)) return 0;
+  }
+  return 1;
 }
 
 int walk_clone(const char *source, const char *destination, struct failure *failure) {
-  struct walker walker = {failure, {0}, {0}, 0};
-  path_init(&walker.source, source);
-  path_init(&walker.destination, destination);
-  int ok = clone_entry(&walker, AT_FDCWD, source, AT_FDCWD, destination, 0);
+  struct walker walker = {.failure = failure};
+  pthread_mutex_init(&walker.lock, NULL);
+  mode_t mask = umask(0);
+  int ok = plan(&walker, source, destination, 0);
+  if (ok && walker.files.count) {
+    size_t count = thread_count(walker.files.count);
+    pthread_t threads[MAX_THREADS];
+    size_t started = 0;
+    while (started + 1 < count && pthread_create(&threads[started], NULL, clone_files, &walker) == 0) started++;
+    clone_files(&walker);
+    for (size_t i = 0; i < started; i++) pthread_join(threads[i], NULL);
+    ok = !walker.failed;
+  }
+  if (ok) ok = finish_directories(&walker);
+  umask(mask);
   if (!ok && walker.created) remove_tree(destination);
-  free(walker.source.text);
-  free(walker.destination.text);
+  release(&walker.files);
+  release(&walker.directories);
+  pthread_mutex_destroy(&walker.lock);
   return ok;
 }

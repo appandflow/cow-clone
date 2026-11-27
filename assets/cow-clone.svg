@@ -93,7 +93,7 @@
   <g transform="translate(560 112)">
     <ellipse cx="0" cy="-16" rx="46" ry="34" fill="url(#dome)" stroke="#1d1d1d" stroke-width="3"/>
     <!-- alien -->
-    <g transform="translate(0 -18)">
+    <g transform="translate(0 -24)">
       <ellipse cx="0" cy="0" rx="15" ry="18" fill="#7ee081" stroke="#1d1d1d" stroke-width="2.5"/>
       <ellipse cx="-6" cy="-2" rx="5" ry="7" fill="#1d1d1d" transform="rotate(-20 -6 -2)"/>
       <ellipse cx="6" cy="-2" rx="5" ry="7" fill="#1d1d1d" transform="rotate(20 6 -2)"/>
@@ -105,7 +105,7 @@
     <ellipse cx="0" cy="2" rx="110" ry="14" fill="#c9d2e3"/>
     <ellipse cx="0" cy="20" rx="58" ry="10" fill="#6f7a92" stroke="#1d1d1d" stroke-width="3"/>
     <g fill="#ffd34d" stroke="#1d1d1d" stroke-width="2">
-      <circle cx="-80" cy="10" r="6"/><circle cx="-46" cy="16" r="6"/><circle cx="46" cy="16" r="6"/><circle cx="80" cy="10" r="6"/>
+      <circle cx="-80" cy="10" r="6"/><circle cx="80" cy="10" r="6"/>
     </g>
     <text x="0" y="24" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="700" fill="#ffffff">clonefile(2)</text>
   </g>

@@ -107,6 +107,7 @@ export function snapshot(root) {
           : "file",
       mode: windows ? undefined : Number(stat.mode & 0o7777n),
       mtime: stat.mtimeNs,
+      created: windows && !stat.isSymbolicLink() ? stat.birthtimeNs : undefined,
     };
     if (entry.type === "link") entry.target = readlinkSync(path);
     else if (entry.type === "file") {

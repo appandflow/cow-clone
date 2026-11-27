@@ -44,6 +44,7 @@ if (process.platform === "darwin") {
     "-D_GNU_SOURCE",
     "-static",
     "-s",
+    "-pthread",
     ...defines,
     "src/main.c",
     "src/linux.c",

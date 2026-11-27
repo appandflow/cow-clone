@@ -20,11 +20,11 @@ for (const result of results)
     console.log(result.destination, result.reason, result.code);
 ```
 
-| Platform | File systems that clone                                   | How                                                          |
-| -------- | --------------------------------------------------------- | ------------------------------------------------------------ |
-| macOS    | APFS                                                      | One `clonefile(2)` call per pair, a whole tree at a time     |
-| Linux    | btrfs, XFS formatted with reflink (the default), bcachefs | `ioctl(FICLONE)` per file, walking the tree                  |
-| Windows  | ReFS, Dev Drive                                           | `FSCTL_DUPLICATE_EXTENTS_TO_FILE` per file, walking the tree |
+| Platform | File systems that clone                                   | How                                                             |
+| -------- | --------------------------------------------------------- | --------------------------------------------------------------- |
+| macOS    | APFS                                                      | One `clonefile(2)` call per pair, a whole tree at a time        |
+| Linux    | btrfs, XFS formatted with reflink (the default), bcachefs | `ioctl(FICLONE)` per file, on up to 8 threads                   |
+| Windows  | ReFS, Dev Drive                                           | `FSCTL_DUPLICATE_EXTENTS_TO_FILE` per file, on up to 32 threads |
 
 The package ships prebuilt binaries for x64 and arm64 on each platform. It has
 no install scripts, no runtime dependencies, and needs no compiler.
@@ -41,9 +41,15 @@ its `clonefile` support ([libuv#3987](https://github.com/libuv/libuv/pull/3987);
 `CopyFileW`, which block-clones on ReFS and Dev Drive only on recent
 Windows 11 and Windows Server 2025 builds
 ([Microsoft](https://learn.microsoft.com/en-us/windows/win32/fileio/block-cloning)),
-and copies otherwise without saying so. `fs.cp` does the
-same per file, so it never clones a tree in one call and never tells you
-whether it cloned.
+and copies otherwise without saying so.
+
+`fs.cpSync` on a directory does not clone even that much. Node 22 copies each
+file with C++ `std::filesystem::copy_file` and ignores `mode`: on Linux that
+is `sendfile(2)`, a full copy (strace on btrfs and XFS shows 40,014
+`sendfile` calls and no `FICLONE` for a 40,014-file tree). On ReFS on Windows
+Server 2025 it calls `CopyFile`, which block-cloned a 512 MiB file but copied
+the small files of a `node_modules` in our tests: their clusters were not
+shared.
 
 On Linux, `copy_file_range(2)` shares extents on btrfs and XFS when it can,
 but also falls back to an in-kernel copy without saying so; it suits a
@@ -176,21 +182,33 @@ Windows on Arm.
 ## Benchmarks
 
 `npm run bench -- --source <dir> --scratch <dir on the same volume>` clones a
-tree in several ways. On an M4 Pro (APFS), a React Native app's
-`node_modules`: 1,104 top-level entries, 51,490 files, 655 MB. Median of 3
-runs:
+tree in several ways and reports the median time and the disk space the first
+run used.
 
-| Variant                                                    |     ms |
-| ---------------------------------------------------------- | -----: |
-| every top-level entry as a pair, one `cloneMany` call      |  1,427 |
-| every top-level entry, one process per entry               |  4,479 |
-| the whole tree as one pair                                 |  1,293 |
-| file by file (the Linux walker, built for macOS)           | 10,669 |
-| `cp -Rc`                                                   |  9,565 |
-| `fs.cpSync` with `COPYFILE_FICLONE` (a real copy on macOS) | 16,396 |
+The CI `bench` job runs it on a generated `node_modules` (361 top-level
+entries, 40,014 files, 5,892 directories) on GitHub-hosted runners: macOS on
+an M1 virtual machine, Linux and Windows on 4 processors, btrfs and XFS on
+loopback images, ReFS on a virtual disk. Median of 5 runs, in ms:
 
-The CI `bench` job runs the same script on a generated `node_modules` on
-APFS, btrfs, XFS and ReFS.
+| Variant                                     |  APFS | btrfs |   XFS |   ReFS |
+| ------------------------------------------- | ----: | ----: | ----: | -----: |
+| every top-level entry, one `cloneMany` call |   385 | 1,081 | 2,235 | 16,301 |
+| every top-level entry, one process each     | 1,426 | 1,708 | 2,989 | 18,740 |
+| the whole tree as one pair                  |   369 |   990 | 1,943 | 14,834 |
+| the whole tree as one pair, one thread      |       | 1,042 | 3,097 | 27,808 |
+| `cp -Rc` / `cp -a --reflink=always`         | 5,302 | 1,201 | 3,516 |        |
+| `fs.cpSync` (copies; see above)             | 9,494 | 1,253 | 2,035 | 15,942 |
+
+`fs.cpSync` used 250 MiB on APFS, 84 MiB on btrfs and 251 MiB on XFS, where
+the clones used up to 28 MiB, for metadata. ReFS reports freed space late,
+so no figure is given there. The APFS clone is one `clonefile(2)` call per
+pair; the walker build, file by file as on Linux, took 3,789 ms. Runners
+vary: the ReFS column comes from a slower runner than the others.
+
+On an M4 Pro (APFS), a React Native app's `node_modules` (1,104 top-level
+entries, 51,490 files, 655 MB) cloned in 1,293 ms as one pair and 1,427 ms as
+1,104 pairs in one call, against 4,479 ms with one process per pair and
+16,396 ms for `fs.cpSync`.
 
 ## Agent skill
 
