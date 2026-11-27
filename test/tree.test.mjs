@@ -160,27 +160,32 @@ for (const { label, binary, parent } of cloneTargets()) {
     assert.equal(existsSync(join(root, "nothing")), false);
   });
 
-  test(
-    `${label}: a failure part-way removes the partial destination`,
-    { skip: windows && "a file the owner cannot read needs an ACL on Windows" },
-    (t) => {
-      const root = scratch(t, parent);
-      const source = join(root, "source");
-      write(join(source, "a", "first"));
-      write(join(source, "z", "unreadable"));
-      write(join(source, "z", "zz"));
-      chmodSync(join(source, "z", "unreadable"), 0);
-      if (process.getuid?.() === 0) return t.skip("root reads every file");
-      const [result] = cloneJson([[source, join(root, "clone")]], binary);
-      if (binary.endsWith("cow-clone-walk") || process.platform === "linux") {
-        assert.equal(result.cloned, false);
-        assert.equal(result.code, "EACCES");
-        assert.equal(result.path, join(source, "z", "unreadable"));
-      }
-      // clonefile(2) clones a file its owner cannot read, since cloning reads no data.
-      if (!result.cloned) assert.equal(existsSync(join(root, "clone")), false);
-    },
-  );
+  test(`${label}: a failure part-way removes the partial destination`, (t) => {
+    const root = scratch(t, parent);
+    const source = join(root, "source");
+    write(join(source, "a", "first"));
+    write(join(source, "z", "unreadable"));
+    write(join(source, "z", "zz"));
+    const unreadable = join(source, "z", "unreadable");
+    if (windows) {
+      const denied = spawnSync(
+        "icacls",
+        [unreadable, "/deny", "*S-1-1-0:(R)"],
+        { encoding: "utf8" },
+      );
+      assert.equal(denied.status, 0, denied.stdout + denied.stderr);
+      t.after(() => spawnSync("icacls", [unreadable, "/remove:d", "*S-1-1-0"]));
+    } else chmodSync(unreadable, 0);
+    if (process.getuid?.() === 0) return t.skip("root reads every file");
+    const [result] = cloneJson([[source, join(root, "clone")]], binary);
+    if (binary.endsWith("cow-clone-walk") || process.platform !== "darwin") {
+      assert.equal(result.cloned, false);
+      assert.equal(result.code, "EACCES");
+      assert.equal(result.path, unreadable);
+    }
+    // clonefile(2) clones a file its owner cannot read, since cloning reads no data.
+    if (!result.cloned) assert.equal(existsSync(join(root, "clone")), false);
+  });
 
   test(
     `${label}: a FIFO stops the pair`,
