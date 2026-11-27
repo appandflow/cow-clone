@@ -174,10 +174,15 @@ for (const { label, binary, parent } of cloneTargets()) {
         { encoding: "utf8" },
       );
       assert.equal(denied.status, 0, denied.stdout + denied.stderr);
-      t.after(() => spawnSync("icacls", [unreadable, "/remove:d", "*S-1-1-0"]));
     } else chmodSync(unreadable, 0);
     if (process.getuid?.() === 0) return t.skip("root reads every file");
-    const [result] = cloneJson([[source, join(root, "clone")]], binary);
+    let result;
+    try {
+      [result] = cloneJson([[source, join(root, "clone")]], binary);
+    } finally {
+      // The deny entry also blocks removing the scratch directory, whose hook runs first.
+      if (windows) spawnSync("icacls", [unreadable, "/remove:d", "*S-1-1-0"]);
+    }
     if (binary.endsWith("cow-clone-walk") || process.platform !== "darwin") {
       assert.equal(result.cloned, false);
       assert.equal(result.code, "EACCES");
