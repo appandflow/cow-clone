@@ -439,8 +439,13 @@ int clone_pair(const char *source, const char *destination, struct failure *fail
     ok = fail(&walker, GetLastError(), REASON_FAILED, &walker.source);
   else if (check_volumes(&walker)) {
     struct entry entry = {data.dwFileAttributes, data.ftCreationTime, data.ftLastAccessTime, data.ftLastWriteTime};
+    size_t root = walker.destination.length;
     ok = clone_entry(&walker, &entry, 0);
-    if (!ok && walker.created) remove_tree(&walker.destination);
+    /* A failure leaves the path at the entry that failed. */
+    if (!ok && walker.created) {
+      path_pop(&walker.destination, root);
+      remove_tree(&walker.destination);
+    }
   } else
     ok = 0;
   free(walker.source.text);
