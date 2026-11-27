@@ -1,5 +1,7 @@
 # cow-clone
 
+![An alien spaceship clones a cow named node_modules](https://raw.githubusercontent.com/appandflow/cow-clone/main/assets/cow-clone.svg)
+
 Copy-on-write clones of files and whole directory trees, from Node or the
 command line, on macOS, Linux and Windows. A clone shares every block with
 its source until one of them changes, so cloning a 4 GB `node_modules` takes
